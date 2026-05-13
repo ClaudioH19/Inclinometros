@@ -19,7 +19,7 @@ services:
     env_file:
       - .env
     ports:
-      - "${APP_PORT:-8000}:8000"
+      - "${HOST_APP_PORT:-8000}:${APP_PORT:-8000}"
     volumes:
       - ./data:/data
 
