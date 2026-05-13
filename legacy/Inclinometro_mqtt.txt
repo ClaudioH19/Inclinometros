@@ -1,0 +1,310 @@
+#include <WiFiS3.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <BH1750.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_CCS811.h>
+#include "FspTimer.h"
+
+// ─────────────────────────────────────────────
+// WiFi / MQTT
+// ─────────────────────────────────────────────
+const char* ssid        = "Utalca-visitas";
+const char* mqtt_server = "38.242.251.218";
+const int   mqtt_port   = 1883;
+const char* mqtt_topic  = "inclinometro/sensores";
+const char* ID_PLACA    = "Nodo_1";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ─────────────────────────────────────────────
+// Sensores
+// ─────────────────────────────────────────────
+BH1750 lightMeter;
+Adafruit_BME280 bme;
+Adafruit_CCS811 ccs;
+
+float lux = -999;
+float temp = -999;
+float hum = -999;
+float pres = -999;
+
+int co2 = -999;
+int tvoc = -999;
+
+bool estadoBH1750 = false;
+bool estadoBME280 = false;
+bool estadoCCS811 = false;
+
+// ─────────────────────────────────────────────
+// Timers tareas
+// ─────────────────────────────────────────────
+unsigned long lastSensorRead = 0;
+unsigned long lastMQTTCheck  = 0;
+
+const unsigned long SENSOR_INTERVAL = 5000;
+const unsigned long MQTT_INTERVAL   = 5000;
+
+// ─────────────────────────────────────────────
+// Pines motores
+// ─────────────────────────────────────────────
+#define STEP1 3
+#define DIR1  4
+#define EN1   5
+
+#define STEP2 6
+#define DIR2  7
+#define EN2   8
+
+// ─────────────────────────────────────────────
+// Parámetros motores
+// ─────────────────────────────────────────────
+const int   MICROSTEPPING = 16;
+const int   PASOS_VUELTA  = 200;
+
+const float RPM_M1 = 60.0;
+const float RPM_M2 = 60.0;
+
+// IMPORTANTE:
+// Esta versión asume que ambos motores usan la misma RPM.
+// Si después quieres RPM distintas para cada motor, se cambia el enfoque.
+
+FspTimer motorTimer;
+
+volatile bool estadoStep = false;
+
+// Frecuencia de toggle HIGH/LOW del pin STEP
+float calcularFrecuenciaToggle(float rpm) {
+  float pasosSegundo = (rpm / 60.0) * PASOS_VUELTA * MICROSTEPPING;
+  float togglesSegundo = pasosSegundo * 2.0;
+  return togglesSegundo;
+}
+
+// Interrupción del timer
+void callbackMotor(timer_callback_args_t __attribute((unused)) *p_args) {
+  estadoStep = !estadoStep;
+
+  digitalWrite(STEP1, estadoStep);
+  digitalWrite(STEP2, estadoStep);
+}
+
+bool iniciarTimerMotores(float rpm) {
+  float frecuenciaToggle = calcularFrecuenciaToggle(rpm);
+
+  uint8_t timer_type = GPT_TIMER;
+  int8_t tindex = FspTimer::get_available_timer(timer_type);
+
+  if (tindex < 0) {
+    timer_type = AGT_TIMER;
+    tindex = FspTimer::get_available_timer(timer_type);
+  }
+
+  if (tindex < 0) {
+    Serial.println("No hay timer disponible");
+    return false;
+  }
+
+  Serial.print("Frecuencia toggle motores Hz: ");
+  Serial.println(frecuenciaToggle);
+
+  motorTimer.begin(
+    TIMER_MODE_PERIODIC,
+    timer_type,
+    tindex,
+    frecuenciaToggle,
+    0.0f,
+    callbackMotor,
+    nullptr
+  );
+
+  motorTimer.setup_overflow_irq();
+  motorTimer.open();
+  motorTimer.start();
+
+  return true;
+}
+
+// ─────────────────────────────────────────────
+// MQTT
+// ─────────────────────────────────────────────
+void gestionarMQTT() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (client.connected()) {
+    client.loop();
+    return;
+  }
+
+  Serial.println("Intentando conectar MQTT...");
+
+  if (client.connect(ID_PLACA)) {
+    Serial.println("MQTT conectado");
+  } else {
+    Serial.print("MQTT fallo, rc=");
+    Serial.println(client.state());
+  }
+}
+
+// ─────────────────────────────────────────────
+// Lectura sensores
+// ─────────────────────────────────────────────
+void leerSensores() {
+  if (estadoBH1750) {
+    lux = lightMeter.readLightLevel();
+  } else {
+    lux = -999;
+  }
+
+  if (estadoBME280) {
+    temp = bme.readTemperature();
+    hum  = bme.readHumidity();
+    pres = bme.readPressure() / 100.0F;
+  } else {
+    temp = -999;
+    hum  = -999;
+    pres = -999;
+  }
+
+  if (estadoCCS811 && ccs.available() && !ccs.readData()) {
+    co2  = ccs.geteCO2();
+    tvoc = ccs.getTVOC();
+  } else if (!estadoCCS811) {
+    co2  = -999;
+    tvoc = -999;
+  }
+}
+
+// ─────────────────────────────────────────────
+// Enviar datos
+// ─────────────────────────────────────────────
+void enviarDatos() {
+  if (!client.connected()) {
+    Serial.println("No se envia: MQTT no conectado");
+    return;
+  }
+
+  StaticJsonDocument<256> doc;
+
+  doc["placa_id"]    = ID_PLACA;
+  doc["lux"]         = lux;
+  doc["temperatura"] = temp;
+  doc["humedad"]     = hum;
+  doc["presion"]     = pres;
+  doc["co2"]         = co2;
+  doc["tvoc"]        = tvoc;
+
+  char buf[256];
+  serializeJson(doc, buf);
+
+  bool ok = client.publish(mqtt_topic, buf);
+
+  if (ok) {
+    Serial.print("Publicado: ");
+    Serial.println(buf);
+  } else {
+    Serial.println("Error publicando MQTT");
+  }
+}
+
+// ─────────────────────────────────────────────
+// Setup
+// ─────────────────────────────────────────────
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  // Motores
+  pinMode(STEP1, OUTPUT);
+  pinMode(DIR1, OUTPUT);
+  pinMode(EN1, OUTPUT);
+
+  pinMode(STEP2, OUTPUT);
+  pinMode(DIR2, OUTPUT);
+  pinMode(EN2, OUTPUT);
+
+  digitalWrite(STEP1, LOW);
+  digitalWrite(STEP2, LOW);
+
+  // Habilitar TB6600
+  digitalWrite(EN1, LOW);
+  digitalWrite(EN2, LOW);
+
+  // Dirección
+  digitalWrite(DIR1, HIGH);
+  digitalWrite(DIR2, HIGH);
+
+  Serial.println("Configuracion motores:");
+  Serial.print("RPM M1: ");
+  Serial.println(RPM_M1);
+  Serial.print("RPM M2: ");
+  Serial.println(RPM_M2);
+
+  // Sensores
+  estadoBH1750 = lightMeter.begin();
+  if (!estadoBH1750) {
+    Serial.println("BH1750 no encontrado");
+  }
+
+  estadoBME280 = bme.begin(0x76);
+  if (!estadoBME280) {
+    Serial.println("BME280 no encontrado");
+  }
+
+  estadoCCS811 = ccs.begin();
+  if (!estadoCCS811) {
+    Serial.println("CCS811 no encontrado");
+  }
+
+  // WiFi primero
+  WiFi.begin(ssid);
+
+  Serial.print("Conectando WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi OK");
+
+  client.setServer(mqtt_server, mqtt_port);
+
+  // Forzar primer intento MQTT pronto
+  lastMQTTCheck = millis() - MQTT_INTERVAL;
+  lastSensorRead = millis() - SENSOR_INTERVAL;
+
+  // Iniciar motores después de configurar WiFi/MQTT
+  if (!iniciarTimerMotores(RPM_M1)) {
+    Serial.println("Error iniciando timer de motores");
+  } else {
+    Serial.println("Timer de motores iniciado");
+  }
+}
+
+// ─────────────────────────────────────────────
+// Loop
+// ─────────────────────────────────────────────
+void loop() {
+  unsigned long ahora = millis();
+
+  // Mantener MQTT vivo si ya está conectado
+  if (client.connected()) {
+    client.loop();
+  }
+
+  // Intentar conectar MQTT cada 5 segundos si no está conectado
+  if (ahora - lastMQTTCheck >= MQTT_INTERVAL) {
+    gestionarMQTT();
+    lastMQTTCheck = ahora;
+  }
+
+  // Sensores + envío cada 5 segundos
+  if (ahora - lastSensorRead >= SENSOR_INTERVAL) {
+    leerSensores();
+    enviarDatos();
+    lastSensorRead = ahora;
+  }
+}
